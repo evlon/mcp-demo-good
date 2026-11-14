@@ -158,21 +158,42 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # 发布后立刻读回，证明"发布成功"不是靠 echo 说的。
-      # npm 索引有延迟，所以这一步容忍 404，但必须证明版本最终出现。
+      # 发布后读回，证明"发布成功"不是靠 echo 说的。
+      #
+      # ⚠️ 第一次跑这条失败了，包其实发上去了 —— 教训写在这里：
+      #
+      #   `npm view` 会读本地缓存。在 CI 里第一次查是 404，那个 404 被缓存下来，
+      #   于是接下来 20 次循环全部命中缓存的 404，看起来"200 秒都没发上去"。
+      #   而实际上 npm 大约 2 分钟就写好了。
+      #
+      # 所以这里做两件事：
+      #   ① `--prefer-online` 强制回源，不吃缓存
+      #   ② 直接查 registry 的 JSON（curl），完全绕开 npm 的缓存层
+      #
+      # 判据不变：必须读到那个版本号，否则 job 失败。
       - name: 验证公网已可读
         run: |
           NAME=$(node -p "require('./package.json').name")
           VER=$(node -p "require('./package.json').version")
-          for i in $(seq 1 20); do
-            FOUND=$(npm view "$NAME@$VER" version 2>/dev/null || true)
-            if [ "$FOUND" = "$VER" ]; then
-              echo "✅ $NAME@$VER 已可从公网读到"
-              npm view "$NAME" dist-tags
+          for i in $(seq 1 24); do
+            # 直接读 registry JSON，取 versions 里有没有这个版本
+            RAW=$(curl -sf "https://registry.npmjs.org/$NAME" || echo '{}')
+            if node -e "
+              const j = JSON.parse(process.argv[1] || '{}');
+              process.exit(j.versions && j.versions['$VER'] ? 0 : 1);
+            " "$RAW" 2>/dev/null; then
+              echo "✅ $NAME@$VER 已在 registry 上"
+              echo "$RAW" | node -e "
+                let s=''; process.stdin.on('data',d=>s+=d).on('end',()=>{
+                  const j=JSON.parse(s);
+                  console.log('   dist-tags: ' + JSON.stringify(j['dist-tags']));
+                  console.log('   shasum:    ' + j.versions['$VER'].dist.shasum);
+                });"
               exit 0
             fi
-            echo "…… 第 $i 次未见，等 10 秒（npm 索引有延迟）"
+            echo "…… 第 $i 次未见（直连 registry，不走 npm 缓存），等 10 秒"
             sleep 10
           done
-          echo "❌ 发布后 200 秒仍读不到 $NAME@$VER"
+          echo "❌ 发布后 240 秒 registry 上仍没有 $NAME@$VER"
+          echo "   注意：publish 那一步是成功的，所以更可能是索引问题或查错了 registry"
           exit 1
