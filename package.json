@@ -1,0 +1,24 @@
+{
+  "name": "mcp-demo-good",
+  "version": "1.0.0",
+  "description": "一个会好好说话的 MCP 演示服务：工具描述说清动什么、能不能撤、影响范围；失败时告诉用户下一步。配合 mcp-demo-bad 对比使用。",
+  "type": "module",
+  "bin": {
+    "mcp-demo-good": "server.mjs"
+  },
+  "main": "server.mjs",
+  "files": [
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "mcp",
+    "demo",
+    "deepseek-harness",
+    "dsh"
+  ],
+  "license": "MIT"
+}

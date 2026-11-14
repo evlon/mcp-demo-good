@@ -1,0 +1,178 @@
+name: ci
+
+# ---------------------------------------------------------------------------
+# 发布流程
+#
+#   push tag v* → test（node 22 + 24）→ publish → 公网 npm
+#
+#   内网 ipmds（registry.ict.cmcc）不在 CI 里发 —— 见下方「为什么内网不进 CI」。
+#
+# ── 一个踩过的坑，写在这里避免重犯 ──────────────────────────────────────
+#
+# actions/checkout 在 tag 触发时检出的是 **detached HEAD**（游离状态），
+# `git branch --contains HEAD` 返回空。
+#
+# 如果测试或守卫脚本依赖"当前在哪个分支"做判断，CI 里必挂，
+# 而本地跑永远通过 —— 那种失败极难排查（团队在 dsh-a2a-groups 上踩过，
+# 一个依赖分支归属的测试让两次发布失败，四个 run 全挂在同一条）。
+#
+# 本包没有任何依赖分支状态的测试，但这条要留着：谁以后加守卫脚本，先看这段。
+#
+# ── 为什么内网不进 CI ──────────────────────────────────────────────────
+#
+# registry.ict.cmcc 在公司内网，GitHub 的 runner 在公网 —— 它根本路由不到。
+# 这不是"配个 secret 就能解决"的问题，是网络可达性问题。
+#
+# 所以内网发布由发版会话在本机执行：
+#
+#   npm pack                                          # 生成 tgz
+#   npm publish <tgz> --registry http://registry.ict.cmcc --tag latest
+#
+# 先 pack 再 publish 那个 tgz，而不是直接 `npm publish` 目录 ——
+# 这样公网与内网发的是**同一个字节**，两源 shasum 才能对上。
+#
+# ── 发布通道 ──────────────────────────────────────────────────────────
+#
+# 版本号不带 prerelease 后缀（如 1.0.0）→ latest
+# 带 -beta.N / -rc.N                    → beta / rc
+#
+# 推导在 "Derive channel" 那一步，不用手工传 --tag。
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 零运行时依赖：不需要 npm ci / pnpm install。
+      # 跳过安装这一步是快的来源，但前提是 package.json 永远不加 dependencies。
+      # 什么时候会变：有人为了省事引了第三个包 —— 那时要回来加安装步骤。
+      - name: 确认零依赖（guard）
+        run: |
+          DEPS=$(node -p "(Object.keys(require('./package.json').dependencies||{}).length)")
+          echo "dependencies 数量: $DEPS"
+          if [ "$DEPS" != "0" ]; then
+            echo "❌ 这个包声明了运行时依赖，但 CI 跳过了安装步骤 —— 会装不上。"
+            echo "   要么去掉依赖，要么在本 workflow 里加安装步骤。"
+            exit 1
+          fi
+          echo "✅ 零依赖，跳过安装"
+
+      - name: 语法检查
+        run: node --check server.mjs
+
+      - name: 协议握手
+        run: |
+          REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1.0.0"}}}'
+          OUT=$(printf '%s\n' "$REQ" | node server.mjs 2>/dev/null)
+          echo "响应: $OUT"
+          echo "$OUT" | grep -q '"protocolVersion"' || { echo "❌ 没有 protocolVersion"; exit 1; }
+          echo "$OUT" | grep -q '"serverInfo"'      || { echo "❌ 没有 serverInfo"; exit 1; }
+          echo "✅ 协议握手正常"
+
+      - name: tools/list
+        run: |
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1.0.0"}}}'
+          LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+          OUT=$(printf '%s\n%s\n' "$INIT" "$LIST" | node server.mjs 2>/dev/null)
+          echo "$OUT"
+          echo "$OUT" | grep -q '"tools"' || { echo "❌ 没有 tools 字段"; exit 1; }
+          echo "✅ tools/list 正常"
+
+      # 打包清单守卫：files 白名单决定用户能装到什么，漏一个文件是静默失败。
+      - name: 打包清单
+        run: |
+          node -e "
+          const p = require('./package.json');
+          const want = ['server.mjs', 'README.md'];
+          for (const f of want) {
+            if (!p.files.includes(f)) { console.error('❌ files 白名单缺 ' + f); process.exit(1); }
+          }
+          if (p.private) { console.error('❌ private:true 会让 npm publish 直接失败'); process.exit(1); }
+          if (!p.bin || Object.keys(p.bin).length === 0) { console.error('❌ 缺 bin，npx 跑不起来'); process.exit(1); }
+          console.log('✅ files / private / bin 都正常');
+          "
+          npm pack --dry-run 2>&1 | tail -12
+
+  publish:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: 校验 tag 与 package.json 版本一致
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          VER=$(node -p "require('./package.json').version")
+          echo "tag=$TAG  package.json=$VER"
+          if [ "$TAG" != "$VER" ]; then
+            echo "❌ tag 与 package.json 版本不一致"
+            exit 1
+          fi
+          echo "✅ 版本一致"
+
+      - name: 推导发布通道
+        id: channel
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          if [[ "$VER" == *"-beta."* ]]; then
+            CH=beta
+          elif [[ "$VER" == *"-rc."* ]]; then
+            CH=rc
+          else
+            CH=latest
+          fi
+          echo "tag=$CH" >> "$GITHUB_OUTPUT"
+          echo "版本 $VER → 通道 $CH"
+
+      # ⚠️ 这里不做兜底重试，失败就是失败。
+      #
+      # 团队在另一个仓库踩过"假绿"：兜底重试的 npm publish 失败后，
+      # 脚本仍然 echo "published" + exit 0 —— CI 绿，包没发出去，
+      # 而当时的报告把"查不到"读成了"没发布"，两个错误叠在一起。
+      #
+      # 所以：一次 publish，失败即让 job 失败。
+      - name: 发布到公网 npm
+        run: npm publish --tag "${{ steps.channel.outputs.tag }}" --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # 发布后立刻读回，证明"发布成功"不是靠 echo 说的。
+      # npm 索引有延迟，所以这一步容忍 404，但必须证明版本最终出现。
+      - name: 验证公网已可读
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VER=$(node -p "require('./package.json').version")
+          for i in $(seq 1 20); do
+            FOUND=$(npm view "$NAME@$VER" version 2>/dev/null || true)
+            if [ "$FOUND" = "$VER" ]; then
+              echo "✅ $NAME@$VER 已可从公网读到"
+              npm view "$NAME" dist-tags
+              exit 0
+            fi
+            echo "…… 第 $i 次未见，等 10 秒（npm 索引有延迟）"
+            sleep 10
+          done
+          echo "❌ 发布后 200 秒仍读不到 $NAME@$VER"
+          exit 1
